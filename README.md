@@ -12,7 +12,7 @@ The server sends us a packfile with the repository data, which we parse to extra
 
 ## File format
 
-Alarm writes `.alarm.gz` files, which hopefully easy to parse and somewhat efficient. The file is gzipped (as you might have guessed already), with the following structure:
+Alarm writes `.alarm.gz` files, which are hopefully easy to parse and somewhat efficient. The file is gzipped (as you might have guessed already), with the following structure:
 
 ~~~~
 - A header appears at the beginning, consisting of:
