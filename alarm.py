@@ -3,6 +3,7 @@ import json
 import hashlib
 import gzip
 import http.client as httpc
+import os
 import struct
 import sys
 import urllib.parse
@@ -12,31 +13,56 @@ import zlib
 with open('token', 'r') as f:
     API_TOKEN = f.read().strip()
 
-def get_some_files(owner, repo):
-    MAX_BRANCHES = 1
+no_api_until = 0
+api_limit_left = 5000
 
-    print('Downloading tree information... ', end='')
-    sys.stdout.flush()
+def has_api_left(num):
+    return api_limit_left >= num or no_api_until < time.time()
+
+def get_from_api(conn, url):
+    global no_api_until
+    global api_limit_left
     
     h = {'User-Agent': 'suyjuris', 'Accept': 'application/vnd.github.v3+json',
          'Authorization': 'token ' + API_TOKEN }
+
+    if no_api_until == 0:
+        # We are not initialized, do that now
+        no_api_until = 1
+        get_from_api(conn, '/rate_limit')
+    
+    dur = no_api_until - time.time()
+    if api_limit_left == 0 and dur > 0:
+        print('No api requests remaining, sleeping for %.0fs' % dur)
+        time.sleep(dur)
+    
+    conn.request('GET', url, headers=h)
+    r = conn.getresponse()
+    api_limit_left = int(r.getheader('X-RateLimit-Remaining'))
+    no_api_until = int(r.getheader('X-RateLimit-Reset')) + 2
+    
+    return json.loads(r.read().decode('utf-8'))
+    
+def get_some_files(owner, repo):
+    MAX_BRANCHES = 1
+
+    if not has_api_left(1 + 2*MAX_BRANCHES):
+        print('Downloading tree information skipped, no api limit left')
+        return []
+    
+    print('Downloading tree information... ', end='')
+    sys.stdout.flush()
+    
     conn = httpc.HTTPSConnection('api.github.com')
 
-    def getapi(loc):
-        conn.request('GET', loc, headers=h)
-        return json.loads(conn.getresponse().read().decode('utf-8'))
-
-    data = getapi('/repos/%s/%s/git/refs' % (owner, repo))[:MAX_BRANCHES]
-    try:           
-        commits = {i['object']['sha'] for i in data}
-        trees = {getapi('/repos/%s/%s/git/commits/%s' % (owner, repo, i))['tree']['sha'] for i in commits}
-    except:
-        print(data)
-        raise
+    data = get_from_api(conn, '/repos/%s/%s/git/refs' % (owner, repo))
+    commits = {i['object']['sha'] for i in data[:MAX_BRANCHES]}
+    loc = '/repos/%s/%s/git/commits/%s'
+    trees = {get_from_api(conn, loc % (owner, repo, i))['tree']['sha'] for i in commits}
 
     files = set()
     for t in trees:
-        data = getapi('/repos/%s/%s/git/trees/%s?recursive=1' % (owner, repo, t))
+        data = get_from_api(conn, '/repos/%s/%s/git/trees/%s?recursive=1' % (owner, repo, t))
         files.update(j['sha'] for j in data['tree'] if j['type'] == 'blob')
         
     conn.close()
@@ -44,22 +70,16 @@ def get_some_files(owner, repo):
     print('Done.')
     print('Found %d files' % len(files))
     
-    return files
+    return list(files)
 
 def get_top100_for_language(lang):
     print('Querying top100 repositories for %s... ' % lang, end='')
     sys.stdout.flush()
     
-    h = {'User-Agent': 'suyjuris', 'Accept': 'application/vnd.github.v3+json',
-         'Authorization': 'token ' + API_TOKEN }
     conn = httpc.HTTPSConnection('api.github.com')
 
-    def getapi(loc):
-        conn.request('GET', loc, headers=h)
-        return json.loads(conn.getresponse().read().decode('utf-8'))
-
     params = urllib.parse.urlencode({'q': 'language:"%s"' % lang, 'sort': 'stars', 'per_page': 100})
-    data = getapi('/search/repositories?%s' % params)
+    data = get_from_api(conn, '/search/repositories?%s' % params)
 
     print('Done.')
     
@@ -267,11 +287,12 @@ class Side_band_64k:
     
 global_64k_buffer = bytearray(64*1024)
 
+MAX_HEADER_SIZE = 256
+    
 def objs(f):
     buf = memoryview(global_64k_buffer)
     class num: pass
     
-    MAX_HEADER_SIZE = 256
 
     num.skipped = 0
     num.commits = 0
@@ -422,7 +443,7 @@ def dump(fname, r):
         f.close()
 
 def fetch_pack(owner, repo):
-    files = get_some_files(owner, repo)
+    files = get_some_files(owner, repo)[:5000]
     #files = []
     #with open('file.cache', 'r') as f:
     #    files = eval(f.read())
@@ -514,7 +535,7 @@ def write_packfile_stream(r, f):
     
 def _write_packfile_helper(r, f, compression):
     it = objs(r)
-    f.write(b'PACK\0\0\0\2\xff\xff\xff\xff')
+    f.write(b'PACK\0\0\0\2\0\0\0\0')
     
     num = 0
     for sha, o in objs(r):
@@ -545,11 +566,105 @@ def write_metadata_object(f, owner, repo):
     print('Done. (%.02fs)' % dur)
 
 ALARMFILE_MAGIC = b'0\x9e\xb9\x08'
-    
-def aquire_metadata(fname, repos):
-    f = gzip.open(fname, 'wb')
 
-    f.write(ALARMFILE_MAGIC)
+def copy_partial_alarmfile(fr, to):
+    BUFSIZE = 64 * 1024
+    buf = bytearray(fr.read(BUFSIZE))
+    repos = []
+
+    def at_end(i, l):
+        i += l
+        if i > len(buf):
+            buf.extend(fr.read(BUFSIZE))
+            if i > len(buf):
+                return True
+        return False
+            
+    
+    while True:
+        i = 0
+        if at_end(i, 100): break
+                
+        # Find the next repo
+        assert buf[:5] == b'REPO '
+        i = buf.find(b'\0', i)
+        owner, repo = buf[5:i].decode('utf-8').split('/')
+        i += 1
+
+        assert(buf[i:i+12] == b'PACK\0\0\0\2\0\0\0\0')
+        i += 12
+
+        flag = True
+        while flag:
+            if at_end(i, 21): flag = False; break
+                
+            # Read the object
+            typ, size, i = objhead(buf, i)
+            if typ == ObjType.OBJ_NONE: break
+            assert typ in (ObjType.OBJ_COMMIT, ObjType.OBJ_TREE)
+            
+            o = zlib.decompressobj()
+            while True:
+                if at_end(i, 20): flag = False; break
+                o.decompress(buf[i:])
+                i = len(buf) - len(o.unused_data)
+                if o.eof: break
+
+        # Skip checksum
+        if at_end(i, 20): flag = False; break
+        i += 20
+
+        if not flag: break
+                    
+        repos.append((owner, repo))
+        print('Found repository %s/%s' % (owner, repo))
+        to.write(buf[:i])
+
+        buf = bytearray(buf[i:])
+        
+    return repos
+
+def aquire_metadata(fname, repos):
+    f = None
+    if os.path.exists(fname):
+        print('Found already existing file %s' % fname)
+        i = 0
+        while True:
+            fname2 = '%s.bak.%d' % (fname, i)
+            if not os.path.exists(fname2): break
+            i += 1
+        os.rename(fname, fname2)
+        f2 = gzip.open(fname2, 'rb')
+        if f2.read(4) != ALARMFILE_MAGIC:
+            f2.close()
+            print('File is not an alarmfile, has been moved to %s' % fname2)
+        else:
+            print('Detected alarmfile, trying to resume download...')
+            f1 = gzip.open(fname,  'xb')
+            f1.write(ALARMFILE_MAGIC)
+                               
+            repos_have = copy_partial_alarmfile(f2, f1)
+            
+            f2.close()
+
+            warnflag = False
+            if not repos_have:
+                print('Warning: No repositories found.')
+                warnflag = True
+            else:
+                print('Found %d repositories.' % len(repos_have))
+                
+                for i in repos_have:
+                    if i in repos:
+                        repos.remove(i)
+
+            if not warnflag:
+                os.remove(fname2)
+            f = f1    
+
+    if f is None:
+        f = gzip.open(fname, 'xb')
+        f.write(ALARMFILE_MAGIC)
     
     for owner, repo in repos:
         write_metadata_object(f, owner, repo)
@@ -568,8 +683,8 @@ def main():
         aquire_metadata('data/top100_%s.alarm.gz' % fileify(lang), repos)
 
 
-#aquire_metadata('temp.alarm.gz', [('angular', 'angular.js')])
+#aquire_metadata('temp.alarm.gz', [('niklasf', 'pyson'), ('suyjuris', 'alarm'), ('suyjuris', 'lampe')])
         
 main()
 
-#aquire_metadata('temp.alarm.gz', [('git', 'git')])
+#aquire_metadata('temp.alarm.gz', [('google', 'guava')])
