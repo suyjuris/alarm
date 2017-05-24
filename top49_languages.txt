@@ -1,5 +1,5 @@
 # Taken from http://githut.info/
-#JavaScript
+JavaScript
 Java
 Python
 CSS
