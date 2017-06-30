@@ -5,3 +5,5 @@
 **/temp*
 token
 data/
+classes/
+out*

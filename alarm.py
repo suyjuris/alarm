@@ -1,8 +1,11 @@
 #!/usr/bin/python3
 # coding: utf-8
 
+import array
 import json
 import hashlib
+import itertools
+import glob
 import gzip
 import http.client as httpc
 import os
@@ -17,8 +20,11 @@ import traceback
 import time
 import zlib
 
+from collections import defaultdict
+
 ALARM_VERSION = '0.1'
 ALARMFILE_MAGIC = b'0\x9e\xb9\x08'
+GRAPHFILE_MAGIC = b'2\x1d\xa2\xea'
 ALARM_INDEX_NAME = 'alarm.idx'
 GITHUB_API_BASE = 'api.github.com'
 GITHUB_MAX_PAGES = 10
@@ -234,21 +240,48 @@ class ObjType:
 
 HASH_DETAIL = 6
 
-class Tree:
-    typ = ObjType.OBJ_TREE
+class Commit:
+    typ = ObjType.OBJ_COMMIT
+    __slots__ = ['blob', 'tree', 'parents']
     
     @classmethod
-    def parse(cls, b):
+    def parse(cls, b, do_blob):
         self = cls()
-        self.blob = b
+        if do_blob:
+            self.blob = b
+        it = iter(b.splitlines())
+        cmd, sha = next(it).split(b' ')
+        assert cmd == b'tree'
+        self.tree = bytes(sha)
+        self.parents = []
+        while True:
+            cmd, sha = next(it).split(b' ', maxsplit=1)
+            if cmd != b'parent': break
+            self.parents.append(bytes(sha))
+        # Ignore the rest of the data
+        return self
+
+    def __str__(self):
+        return (b'Commit(tree=%s, parents=[%s])' % (self.tree[:HASH_DETAIL], b', '.join(
+            i[:HASH_DETAIL] for i in self.parents))).decode('utf-8')
+
+class Tree:
+    typ = ObjType.OBJ_TREE
+    __slots__ = ['blob', 'entries']
+    
+    @classmethod
+    def parse(cls, b, do_blob):
+        self = cls()
+        if do_blob:
+            self.blob = b
         self.entries = []
         i = j = 0
         while i < len(b):
             i, j = b.find(b' ', i+1), i
             assert i != -1
-            mode = b[j:i]
+            mode = bytes(b[j:i])
             i, j = b.find(b'\0', i+1), i+1
-            name = b[j:i]
+            name = bytes(b[j:i])
             sha = b[i+1:i+21].hex().encode('ascii')
             self.entries.append((mode, name, sha))
             i += 21
@@ -258,32 +291,12 @@ class Tree:
         return (b'Tree(entries=[\n  %s\n])' % b',\n  '.join(b'(%s, %s, %s)' % 
             (i[0], i[2][:HASH_DETAIL], i[1]) for i in self.entries)).decode('utf-8')
 
-class Commit:
-    typ = ObjType.OBJ_COMMIT
+class Blob:
+    __slots__ = ['blob']
     
     @classmethod
-    def parse(cls, b):
-        self = cls()
-        self.blob = b
-        it = iter(b.splitlines())
-        cmd, sha = next(it).split(b' ')
-        assert cmd == b'tree'
-        self.tree = sha
-        self.parents = []
-        while True:
-            cmd, sha = next(it).split(b' ', maxsplit=1)
-            if cmd != b'parent': break
-            self.parents.append(sha)
-        # Ignore the rest of the data
-        return self
-
-    def __str__(self):
-        return (b'Commit(tree=%s, parents=[%s])' % (self.tree[:HASH_DETAIL], b', '.join(
-            i[:HASH_DETAIL] for i in self.parents))).decode('utf-8')
-
-class Blob:
-    @classmethod
-    def parse(cls, b):
+    def parse(cls, b, do_blob):
+        if not do_blob: return None
         self = cls()
         self.blob = b
         return self
@@ -401,7 +414,7 @@ global_64k_buffer = bytearray(64*1024)
 
 MAX_HEADER_SIZE = 256
     
-def objs(f, do_parse=True):
+def parse_pack(f, do_parse=True, do_summary=True, stream_state=None, do_blobs=True):
     buf = memoryview(global_64k_buffer)
     class num: pass
 
@@ -415,17 +428,7 @@ def objs(f, do_parse=True):
     blobstore = {}
     typestore = {}
     offsstore = {}
-
-    num.rbytes += f.readinto(buf[:12])
-    assert buf[:8] == b'PACK\0\0\0\2'
-    
-    num.total  = int.from_bytes(buf[8:12], byteorder='big')
-    num.left   = num.total
-
-    # Compatibility with our own metadata stream
-    if num.left == 0:
-        num.left = None
-
+        
     if do_parse:
         cls_commit = Commit
         cls_tree   = Tree
@@ -471,41 +474,58 @@ def objs(f, do_parse=True):
         h = hashlib.sha1()
         h.update(b'%s %d\0' % (ObjType.typename(typ), len(data)))
         h.update(data)
-        sha = h.digest().hex()
-        blobstore[sha] = data
-        typestore[sha] = typ
-        offsstore[offset] = sha
+        sha = h.digest().hex().encode('ascii')
+        if do_blobs:
+            blobstore[sha] = data
+            typestore[sha] = typ
+            offsstore[offset] = sha
         if typ == ObjType.OBJ_COMMIT:
             num.commits += 1
-            return sha, cls_commit.parse(data)
+            return sha, cls_commit.parse(data, do_blobs)
         elif typ == ObjType.OBJ_TREE:
             num.trees += 1
-            return sha, cls_tree.parse(data)
+            return sha, cls_tree.parse(data, do_blobs)
         else:
             assert False
 
     start = 0
-    end = f.readinto(buf)
+    if stream_state is None:
+        end = f.readinto(buf)
+    else:
+        start, end, _ = stream_state
+        end += f.readinto(buf[end:])
+
+    assert buf[start:start+8] == b'PACK\0\0\0\2'
+    start += 8
+    num.total  = int.from_bytes(buf[start:start+4], byteorder='big')
+    num.left   = num.total
+    start += 4            
+
+    # Compatibility with our own metadata stream
+    if num.left == 0 or num.left == 0xffffffff:
+        num.left = None
+    
     num.rbytes += end
-    while num.left:
-        if start == 0 and time.clock() > time_last + 1:
+    while num.left is None or num.left > 0:
+        if start == 0 and time.clock() > time_last + 3:
             time_last = time.clock()
             if num.left is not None:
                 print('Downloading... (%d/%d)' % (num.total - num.left, num.total))
             else:
-                print('Reading... (%d)' % (num.total - num.left, num.total))
+                print('Reading... (%d MiB, %d commits, %d trees)'
+                      % (num.rbytes / 2**20, num.commits, num.trees))
                 
         if start == end: break
         offset = num.rbytes - (end - start)
         typ, size, off = objhead(buf[start:])
-
-        # Compatibility with our own metadata stream
-        if typ == ObjType.OBJ_NONE:
-            break
         
         start += off
         o = zlib.decompressobj()
-        if typ in (ObjType.OBJ_COMMIT, ObjType.OBJ_TREE):
+        
+        if   typ == ObjType.OBJ_NONE:
+            # Compatibility with our own metadata stream
+            break
+        elif typ in (ObjType.OBJ_COMMIT, ObjType.OBJ_TREE):
             start, end, data = read(start, end)
             assert len(data) == size
             yield handle(typ, data, offset)
@@ -533,10 +553,12 @@ def objs(f, do_parse=True):
                 yield handle(typestore[sha_base], data, offset)
         else:
             assert False
-        num.left -= 1
 
+        if num.left is not None:
+            num.left -= 1
+
+        # Make sure that there is always a minimum of MAX_HEADER_SIZE bytes left
         if start > end - MAX_HEADER_SIZE:
-            # Make sure that there is always a minimum of MAX_HEADER_SIZE bytes left
             buf[:end-start] = buf[start:end]
             end -= start
             start = 0
@@ -544,11 +566,30 @@ def objs(f, do_parse=True):
             end += i
             num.rbytes += i
 
-    # Skip the SHA1 checksum
-    assert end - start == 20
+    
+    # Make sure that there is always a minimum of 21 bytes left
+    if start > end - 21:
+        buf[:end-start] = buf[start:end]
+        end -= start
+        start = 0
+        i = f.readinto(buf[end:])
+        end += i
+        num.rbytes += i
 
-    print('Commits: %d\nTrees:   %d\nSkipped: %d\nTotal:   %d'
-          % (num.commits, num.trees, num.skipped, num.total))
+    if stream_state is None:
+        # Skip the SHA1 checksum
+        assert end - start == 20
+    else:
+        # This should hold, as we are parsing a metadata stream
+        assert buf[start:start+20] == b'\0'*20
+        start += 20
+        stream_state[0] = start
+        stream_state[1] = end
+        stream_state[2] = start == end
+
+    if do_summary:
+        print('Commits: %d\nTrees:   %d\nSkipped: %d\nTotal:   %d'
+              % (num.commits, num.trees, num.skipped, num.total))
     
 def dump(fname, r):
     with open(fname, 'wb') as f:
@@ -570,12 +611,18 @@ def fetch_pack(owner, repo):
     conn = httpc.HTTPSConnection('github.com')
     try:
         conn.request('GET', '/%s/%s.git/info/refs?service=git-upload-pack' % (owner, repo), headers=h)
-        it = pkt_line(conn.getresponse().read())
+        data = conn.getresponse().read()
+        if data.startswith(b'Repo'):
+            return None
+        it = pkt_line(data)
         assert next(it).rstrip(b'\n') == b'# service=git-upload-pack'
         assert next(it) is None
 
         # Ignore the default ref, will be in the lates ones also
-        ref1, cap = next(it).split(b'\0')
+        data = next(it)
+        if data is None:
+            return None
+        ref1, cap = data.split(b'\0')
 
         # Don't download all refs, just the first one
         #refs = [i.split(b' ')[0] for i in it if i is not None]
@@ -645,11 +692,11 @@ def write_packfile_stream(r, f):
     f.write(bytes(21))
     
 def _write_packfile_helper(r, f, compression):
-    it = objs(r)
+    it = parse_pack(r)
     f.write(b'PACK\0\0\0\2\0\0\0\0')
     
     num = 0
-    for sha, o in objs(r):
+    for sha, o in parse_pack(r):
         l = len(o.blob)
         b = (o.typ << 4) | (l & 15)
         l >>= 4
@@ -667,16 +714,18 @@ def write_metadata_object(f, owner, repo):
 
     print('Acquiring %s/%s...' % (owner, repo))
     
-    # Write header
-    f.write(('REPO %s/%s\0' % (owner, repo)).encode('utf-8'))
-    
     r = fetch_pack(owner, repo)
-    try:
-        write_packfile_stream(r, f)
-    finally:
-        r.close()
-
-    print('Done. (%.02fs)' % (time.clock() - time_start))
+    if not r:
+        print('\nRepository not found, or no valid ref. (%.02fs)' % (time.clock() - time_start))
+    else:
+        # Write header
+        f.write(('REPO %s/%s\0' % (owner, repo)).encode('utf-8'))
+    
+        try:
+            write_packfile_stream(r, f)
+        finally:
+            r.close()
+        print('Done. (%.02fs)' % (time.clock() - time_start))
 
 def find_repos_and_offset(f):
     buf = memoryview(global_64k_buffer)
@@ -764,7 +813,7 @@ def copy_bytes(fr, to, rbyte):
 # Quick hack for repositories that break alarm. Currently only this one.
 repos_to_skip = [('Homebrew', 'legacy-homebrew')]
 
-def acquire_metadata(fname, repos_arg, idx):
+def acquire_metadata(fname, repos_arg, idx, force_if_empty=False):
     dname = os.path.basename(fname)
 
     repos = []
@@ -777,7 +826,7 @@ def acquire_metadata(fname, repos_arg, idx):
             continue
         repos.append(i)
 
-    if not repos:
+    if not repos and not force_if_empty:
         print('No repositories left to acquire.')
         return
     
@@ -842,7 +891,7 @@ def acquire_metadata(fname, repos_arg, idx):
                 f = f1
 
     if f is None:
-        f = io.BufferedWriter(gzip.open(fname, 'xb'))
+        f = io.BufferedWriter(gzip.open(fname, 'xb', compresslevel=7))
         f.write(ALARMFILE_MAGIC)
         offset = 0
         repos_have = []
@@ -960,6 +1009,45 @@ def cmd_acquire(dname, *repos_str):
     idx = init_index()
     init_github_api()
 
+    if not repos:
+        del idx.files[dname]
+        acquire_metadata(fname, repos, idx, force_if_empty=True)
+    else:
+        acquire_metadata(fname, repos, idx)
+
+def read_repofile(fname):
+    repos = []
+    with open(fname, 'r') as f:
+        for l_orig in f:
+            l = l_orig.strip()
+            if l.startswith('#'): continue
+            if l.startswith('https://github.com/'):
+                l = l[len('https://github.com/'):]
+            on = tuple(l.split('/'))
+            if len(on) != 2:
+                die(f'The following file is not in the required format:\n{l_orig}')
+            repos.append(on)
+    return repos
+    
+def cmd_acquire_files(dname, *repos_file):
+    data_dir = options.data
+
+    if not dname.endswith('.alarm.gz'):
+        print(f'Warning: {dname} does not end with .alarm.gz, adding it')
+        dname += '.alarm.gz'
+    fname = os.path.join(data_dir, dname)
+        
+    repos = []
+    for i in repos_file:
+        repos += read_repofile(i)
+
+    if not os.path.exists(data_dir):
+        print(f'{data_dir} does not exist, will be created')
+        os.makedirs(data_dir)
+
+    idx = init_index()
+    init_github_api()
+
     acquire_metadata(fname, repos, idx)
         
 def cmd_by_language(lang_file):
@@ -1004,12 +1092,94 @@ def cmd_small(startpage=1):
         if global_stop_flag: break
         page += 1
 
+def cmd_list_contents(outfile, *dnames):
+    data_dir = options.data
+
+    if not os.path.exists(data_dir):
+        die(f'The data directory ({data_dir}) does not exist!')
+
+    dnames = [os.path.basename(j) for i in dnames for j in glob.glob(os.path.join(data_dir, i))]
+        
+    idx = init_index()
+
+    counter = 0
+    with open(outfile, 'w') as f:
+        for dname in dnames:
+            if not dname.endswith('.alarm.gz'):
+                print(f'Warning: {dname} does not end with .alarm.gz, adding it')
+                dname += '.alarm.gz'
+            fname = os.path.join(data_dir, dname)
+            f2 = gzip.open(fname, 'rb')
+            
+            if dname in idx.files:
+                print(f'File {dname} is in the index')
+                repos_have = [i for i, v in idx.repos.items() if v == dname]
+            elif f2.read(4) != ALARMFILE_MAGIC:
+                f2.close()
+                die(f'File {fname} is not an alarmfile.')
+            else:
+                # Untested, beware
+                print(f'Scanning {fname} for repositories...')
+                repos_have, _ = find_repos_and_offset(f2)
+                f2.close()
+                
+            counter += len(repos_have)
+            for i in repos_have:
+                f.write('%s/%s\n' % i)
+    print(f'Wrote {counter} repositories.')
+
+def init_tags(idx):
+    tags = {}
+    for fname in glob.glob(os.path.join(options.classes, '*.lst')):
+        tag = os.path.basename(fname)[:-4]
+        tags[tag] = set(read_repofile(fname))
+    for repo in idx.repos:
+        tags['repo_' + '/'.join(repo)] = {repo}
+    return tags
+
+def cmd_graph_job(outfile, *tag_filter):
+    data_dir = options.data
+
+    if not os.path.exists(data_dir):
+        die(f'The data directory ({data_dir}) does not exist!')
+        
+    idx = init_index()
+    tags = init_tags(idx)
+
+    for tag in tag_filter:
+        if tag not in tags:
+            die(f'Tag {tag} is unknown.')
+            
+    repos = set()
+    infiles = set()
+    for repo, dname in idx.repos.items():
+        if all(repo in tags[tag] for tag in tag_filter):
+            repos.add(repo)
+            infiles.add(dname)
+
+    print(f'Found {len(repos)} repositories, from {len(infiles)} data files')
+
+    f = open(outfile, 'w')
+
+    repos   = sorted(list(repos  ))
+    infiles = sorted(list(infiles))
+
+    f.write('alarm_jobfile_header %s %s\n' % (len(repos), len(infiles)))
+    for repo in repos:
+        f.write('repo %s/%s\n' % repo)
+    for dname in infiles:
+        fname_abs = os.path.abspath(os.path.join(data_dir, dname))
+        f.write('file %s\n' % fname_abs)
+    
+    f.close()
+
 class options:
     AT_LEAST_ONE = object()
     AT_MOST_ONE = object()
     
     _arg_1 = {
         'data':           ('d', str, 'data'),
+        'classes':        ('c', str, 'classes'),
         'index':          ('i', str, ALARM_INDEX_NAME),
         'token_file':     ('t', str, 'token'),
         'files_max_refs': ('B', int, 1),
@@ -1020,9 +1190,12 @@ class options:
     }
     _commands = {
         'acquire': AT_LEAST_ONE,
+        'acquire_files': AT_LEAST_ONE,
         'by_language': 1,
         'small': AT_MOST_ONE,
         'genindex': 0,
+        'list_contents': AT_LEAST_ONE,
+        'graph_job': AT_LEAST_ONE,
     }
 
     @classmethod
@@ -1051,26 +1224,46 @@ Usage: {sys.argv[0]} [options...] command [args...]
         
 # Commands
 
-  acquire <file> <repo> [<repo> ...]
-    Acquire the repositories and write them into <file>. If <file> is an alarmfile, the data will \
-be appended. Else, it will be moved away. If an index exist, it will be used to skip already \
-downloaded repositories. <file> should be specified relative to the data directory. Each <repo> \
-should be of the form <owner>/<name>.
+  acquire <target> [<repo> ...]
+    Acquire the repositories and write them into <target>. If <target> is an alarmfile, the data \
+will be appended. Else, it will be moved away. If an index exist, it will be used to skip already \
+downloaded repositories. <target> should be specified relative to the data directory. Each <repo> \
+should be of the form <owner>/<name>. You can give no repositories to have alarm try and repair \
+the file.
+
+  acquire_files <target> <file> [<file> ...]
+    Acquire the repositories listed in the files <file>, in the same way as the command acquire. \
+These should contain one repository per line, in the format <owner>/<name> or https://github.com/<o\
+wner>/<name> . Lines starting with a # will be ignored.
 
   by_language <lst>
-    Acquire the top100 repositories for the languages specified in the file <lst>, in the same way as \
-the command acquire.
+    Acquire the top100 repositories for the languages specified in the file <lst>, in the same way \
+as the command acquire.
 
   small
     Acquire small repositories into the data directory, in the same way as the command acquire.
 
   genindex
-    Generate an index for the files in the data directory. If an index already exists, it is updated.
+    Generate an index for the files in the data directory. If an index already exists, it is \
+updated. This operation should not be necessary in normal operation.
+
+  list_contents <file> <target> [<target> ...]
+    Write a list of all repositories contained in the files <target> into <file>, in the format \
+<owner>/<repo>, with one repository per line. <target> should be specified relative to the data \
+directory. They are interpreted as glob-like pattern.
+
+  graph_job <file> <tag> [<tag> ...]
+    Similar to write_graphs, but only writes a description of the operations to be performed into a file.
 
 # Options
 
   {options.describe('data')}
     Location of the data directory. Most things happen relative to the data directory.
+
+  {options.describe('classes')}
+    Location of the classes directory. It may contain files that add tags to certain repositories. \
+Each file in that directory should have the same format as the files for acquire_files and the \
+name <tag>.lst . Then, <tag> will be considered a tag of each listed repository.
 
   {options.describe('index')}
     Name of the index file.
@@ -1122,6 +1315,10 @@ def parse_cmdline(args):
             raise Arg_parse_error(f'Unexpected end of arguments, expected {name}')
         return args.pop()
 
+    if not args:
+        print_usage()
+        sys.exit(2)
+    
     state = 0
     while True:
         arg = pop('an option or command')
@@ -1171,13 +1368,17 @@ def main():
     signal.signal(signal.SIGINT, request_stop_handler)
     try:              
         cmd, cmd_args = parse_cmdline(sys.argv)
-        {   'acquire':     cmd_acquire,
-            'by_language': cmd_by_language,
-            'small':       cmd_small,
-            'genindex':    cmd_genindex,
+        {   'acquire':       cmd_acquire,
+            'acquire_files': cmd_acquire_files,
+            'by_language':   cmd_by_language,
+            'small':         cmd_small,
+            'genindex':      cmd_genindex,
+            'list_contents': cmd_list_contents,
+            'graph_job':     cmd_graph_job,
         }[cmd](*cmd_args)
     except Arg_parse_error as e:
         print('Error while parsing arguments:', str(e), file=sys.stderr)
         sys.exit(1)
+
 
 main()
