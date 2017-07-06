@@ -57,6 +57,10 @@ def has_api_left(num_core, num_search):
 
 def init_github_api():
     global global_api_token
+    if not os.path.exists(options.token_file):
+        print("Error: File 'token' does not exist. Please create such a file, containing your GitHub API token.")
+        sys.exit(15)
+
     with open(options.token_file, 'r') as f:
         global_api_token = f.read().strip()
     
@@ -181,7 +185,7 @@ def get_small_repos_helper(sector, page, conn):
         if sector not in global_sector_max_stars:
             get_small_repos_helper(sector - 1, GITHUB_MAX_PAGES, conn)
         max_stars = global_sector_max_stars[sector]
-        q_suf = f' stars:<={max_stars}'
+        q_suf = ' stars:<=%d' % (max_stars,)
         
     mm = options.small_min, options.small_max, q_suf
     params = urllib.parse.urlencode({
@@ -819,10 +823,10 @@ def acquire_metadata(fname, repos_arg, idx, force_if_empty=False):
     repos = []
     for i in repos_arg:
         if i in idx.repos:
-            print(f"Skipping repository {'/'.join(i)}, already exists in file {idx.repos[i]}")
+            print("Skipping repository %s, already exists in file %s" % ('/'.join(i), idx.repos[i]))
             continue
         if i in repos_to_skip:
-            print(f"Skipping repository {'/'.join(i)}")
+            print("Skipping repository %s" % ('/'.join(i),))
             continue
         repos.append(i)
 
@@ -843,7 +847,7 @@ def acquire_metadata(fname, repos_arg, idx, force_if_empty=False):
         f2 = gzip.open(fname2, 'rb')
 
         if dname in idx.files:
-            print(f'File {dname} is in the index, skipping right ahead...')
+            print('File %s is in the index, skipping right ahead...' % (dname,))
             offset = idx.files[dname][Index.F_OFFSET]
             repos_have = [i for i, v in idx.repos.items() if v == dname]
             
@@ -925,20 +929,20 @@ class Index:
         self.files[dname] = size, offset
         for i in repos:
             if i in self.repos and self.repos[i] != dname:
-                print(f'Warning: Repository {i} is contained in both {dname} and {self.repos[i]}')
+                print('Warning: Repository %s is contained in both %s and %s' % (i, dname, self.repos[i]))
             else:
                 self.repos[i] = dname
 
 def init_index(also_rebuild=False):
     data_dir = options.data
     if not os.path.isdir(data_dir):
-        die(f'{data_dir} does not exist or is not a directory')
+        die('%s does not exist or is not a directory' % (data_dir,))
 
     idx = Index()
     idx.fname = os.path.join(options.data, options.index)
              
     if os.path.isdir(idx.fname):
-        die(f'{idx_fname} is a directory, was supposed to be an indexfile')
+        die('%s is a directory, was supposed to be an indexfile' % (idx_fname,))
         
     if os.path.isfile(idx.fname):
         with open(idx.fname, 'r') as f:
@@ -950,7 +954,7 @@ def init_index(also_rebuild=False):
     files = [i for i in os.listdir(data_dir) if (i.endswith('.alarm.gz')
         and os.path.isfile(os.path.join(data_dir, i)))]
     if also_rebuild:
-        print(f'Found {len(files)} files to index')
+        print('Found %d files to index' % (len(files),))
 
     up_to_date = set()
     for dname in list(idx.files):
@@ -958,7 +962,7 @@ def init_index(also_rebuild=False):
         good = os.path.exists(fname) and idx.files[dname][Index.F_SIZE] == os.path.getsize(fname)
         if good:
             if also_rebuild:
-                print(f'File {dname} is already indexed, no changes detected')
+                print('File %s is already indexed, no changes detected' % (dname,),)
             up_to_date.add(dname)
         else:
             del idx.files[dname]
@@ -968,7 +972,7 @@ def init_index(also_rebuild=False):
         for dname in files:
             fname = os.path.join(data_dir, dname)
             if dname in up_to_date: continue
-            print(f'Currently indexing {fname}...')
+            print('Currently indexing %s...' % (fname,))
             with gzip.open(fname, 'rb') as f:
                 assert f.read(4) == ALARMFILE_MAGIC
                 repos, offset = find_repos_and_offset(f)
@@ -991,7 +995,7 @@ def cmd_acquire(dname, *repos_str):
     data_dir = options.data
 
     if not dname.endswith('.alarm.gz'):
-        print(f'Warning: {dname} does not end with .alarm.gz, adding it')
+        print('Warning: %s does not end with .alarm.gz, adding it' % (dname,))
         dname += '.alarm.gz'
     fname = os.path.join(data_dir, dname)
         
@@ -999,18 +1003,18 @@ def cmd_acquire(dname, *repos_str):
     for i in repos_str:
         on = tuple(i.split('/'))
         if len(on) != 2:
-            die(f'Each repository must be in the form <owner>/<name>, got {i}')
+            die('Each repository must be in the form <owner>/<name>, got %s' % (i,))
         repos.append(on)
 
     if not os.path.exists(data_dir):
-        print(f'{data_dir} does not exist, will be created')
+        print('%s does not exist, will be created' % (data_dir,))
         os.makedirs(data_dir)
         
     idx = init_index()
     init_github_api()
 
     if not repos:
-        del idx.files[dname]
+        idx.files.pop(dname, None)
         acquire_metadata(fname, repos, idx, force_if_empty=True)
     else:
         acquire_metadata(fname, repos, idx)
@@ -1025,7 +1029,7 @@ def read_repofile(fname):
                 l = l[len('https://github.com/'):]
             on = tuple(l.split('/'))
             if len(on) != 2:
-                die(f'The following file is not in the required format:\n{l_orig}')
+                die('The following file is not in the required format:\n' + l_orig)
             repos.append(on)
     return repos
     
@@ -1033,7 +1037,7 @@ def cmd_acquire_files(dname, *repos_file):
     data_dir = options.data
 
     if not dname.endswith('.alarm.gz'):
-        print(f'Warning: {dname} does not end with .alarm.gz, adding it')
+        print('Warning: %s does not end with .alarm.gz, adding it' % (dname,))
         dname += '.alarm.gz'
     fname = os.path.join(data_dir, dname)
         
@@ -1042,7 +1046,7 @@ def cmd_acquire_files(dname, *repos_file):
         repos += read_repofile(i)
 
     if not os.path.exists(data_dir):
-        print(f'{data_dir} does not exist, will be created')
+        print('%s does not exist, will be created' % (data_dir,))
         os.makedirs(data_dir)
 
     idx = init_index()
@@ -1054,10 +1058,10 @@ def cmd_by_language(lang_file):
     data_dir = options.data
     
     if not os.path.isfile(lang_file):
-        die(f'{lang_file} does not exist or is not a file')
+        die('%s does not exist or is not a file' % (lang_file,))
 
     if not os.path.exists(data_dir):
-        print(f'{data_dir} does not exist, will be created')
+        print('%s does not exist, will be created' % (data_dir,))
         os.makedirs(data_dir)
 
     idx = init_index()
@@ -1077,7 +1081,7 @@ def cmd_small(startpage=1):
     data_dir = options.data
 
     if not os.path.exists(data_dir):
-        print(f'{data_dir} does not exist, will be created')
+        print('%s does not exist, will be created' % (data_dir,))
         os.makedirs(data_dir)
 
     idx = init_index()
@@ -1086,7 +1090,7 @@ def cmd_small(startpage=1):
     page = int(startpage)
     while True:
         repos = get_small_repos(page)
-        dname = f'small_page{page}.alarm.gz'
+        dname = 'small_page%d.alarm.gz' % (d,)
         acquire_metadata(os.path.join(data_dir, dname), repos, idx)
         
         if global_stop_flag: break
@@ -1095,8 +1099,14 @@ def cmd_small(startpage=1):
 def cmd_list_contents(outfile, *dnames):
     data_dir = options.data
 
+    dnames = list(dnames)
+    for i in range(len(dnames)):
+        if not dnames[i].endswith('.alarm.gz'):
+            print('Warning: %s does not end with .alarm.gz, adding it' % (dnames[i],))
+            dnames[i] += '.alarm.gz'
+
     if not os.path.exists(data_dir):
-        die(f'The data directory ({data_dir}) does not exist!')
+        die('The data directory (%s) does not exist!' % (data_dir,))
 
     dnames = [os.path.basename(j) for i in dnames for j in glob.glob(os.path.join(data_dir, i))]
         
@@ -1106,27 +1116,27 @@ def cmd_list_contents(outfile, *dnames):
     with open(outfile, 'w') as f:
         for dname in dnames:
             if not dname.endswith('.alarm.gz'):
-                print(f'Warning: {dname} does not end with .alarm.gz, adding it')
+                print('Warning: %s does not end with .alarm.gz, adding it' % (dname,))
                 dname += '.alarm.gz'
             fname = os.path.join(data_dir, dname)
             f2 = gzip.open(fname, 'rb')
             
             if dname in idx.files:
-                print(f'File {dname} is in the index')
+                print('File %s is in the index' % (dname,))
                 repos_have = [i for i, v in idx.repos.items() if v == dname]
             elif f2.read(4) != ALARMFILE_MAGIC:
                 f2.close()
-                die(f'File {fname} is not an alarmfile.')
+                die('File %s is not an alarmfile.' % (fname,))
             else:
                 # Untested, beware
-                print(f'Scanning {fname} for repositories...')
+                print('Scanning %s for repositories...' % (fname,))
                 repos_have, _ = find_repos_and_offset(f2)
                 f2.close()
                 
             counter += len(repos_have)
             for i in repos_have:
                 f.write('%s/%s\n' % i)
-    print(f'Wrote {counter} repositories.')
+    print('Wrote %d repositories.' % (counter,))
 
 def init_tags(idx):
     tags = {}
@@ -1141,14 +1151,14 @@ def cmd_graph_job(outfile, *tag_filter):
     data_dir = options.data
 
     if not os.path.exists(data_dir):
-        die(f'The data directory ({data_dir}) does not exist!')
+        die('The data directory (%s) does not exist!' % (data_dir,))
         
     idx = init_index()
     tags = init_tags(idx)
 
     for tag in tag_filter:
         if tag not in tags:
-            die(f'Tag {tag} is unknown.')
+            die('Tag %s is unknown.' % (tag,))
             
     repos = set()
     infiles = set()
@@ -1157,7 +1167,7 @@ def cmd_graph_job(outfile, *tag_filter):
             repos.add(repo)
             infiles.add(dname)
 
-    print(f'Found {len(repos)} repositories, from {len(infiles)} data files')
+    print('Found %d repositories, from %d data files' % (len(repos), len(infiles)))
 
     f = open(outfile, 'w')
 
@@ -1186,7 +1196,7 @@ class options:
         'files_max_num':  ('F', int, 5000),
         'small_min':      ('m', int, 10000),
         'small_max':      ('M', int, 100000),
-        'user_agent':     ('u', str, f'alarm/{ALARM_VERSION}'),
+        'user_agent':     ('u', str, 'alarm/' + ALARM_VERSION),
     }
     _commands = {
         'acquire': AT_LEAST_ONE,
@@ -1211,7 +1221,7 @@ class options:
     @classmethod
     def describe(cls, name):
         short, _, val = cls._arg_1[name]
-        return f"--{name.replace('_', '-')},-{short} <arg> [default: {val}]"
+        return "--%s,-%s <arg> [default: %s]" % (name.replace('_', '-'), short, val)
 
     @classmethod
     def set(cls, name, val):
@@ -1219,8 +1229,8 @@ class options:
         
     
 def print_usage(f = sys.stdout):
-    s = f'''\
-Usage: {sys.argv[0]} [options...] command [args...]
+    s = '''\
+Usage: ''' + sys.argv[0] + ''' [options...] command [args...]
         
 # Commands
 
@@ -1257,41 +1267,41 @@ directory. They are interpreted as glob-like pattern.
 
 # Options
 
-  {options.describe('data')}
+  ''' + options.describe('data') + '''
     Location of the data directory. Most things happen relative to the data directory.
 
-  {options.describe('classes')}
+  ''' + options.describe('classes') + '''
     Location of the classes directory. It may contain files that add tags to certain repositories. \
 Each file in that directory should have the same format as the files for acquire_files and the \
 name <tag>.lst . Then, <tag> will be considered a tag of each listed repository.
 
-  {options.describe('index')}
+  ''' + options.describe('index') + '''
     Name of the index file.
 
-  {options.describe('token_file')}
+  ''' + options.describe('token_file') + '''
     File to read the GitHub API token from.
 
-  {options.describe('files_max_refs')}
+  ''' + options.describe('files_max_refs') + '''
     Maximum number of refs to load when prefetching files.
 
-  {options.describe('files_max_num')}
+  ''' + options.describe('files_max_num') + '''
     Maximum number of prefetched files that will be passed to the server while negotiating packs. \
 (Bigger files are passed first.)
 
-  {options.describe('small_min')}
+  ''' + options.describe('small_min') + '''
     Minimum size of a repository to be considered small (in KiB).
 
-  {options.describe('small_max')}
+  ''' + options.describe('small_max') + '''
     Maximum size of a repository to be considered small (in KiB).
 
-  {options.describe('user_agent')}
+  ''' + options.describe('user_agent') + '''
     String to send as user-agent in both API and pack-negotiation requests.
 
   --help,-h
     Print this help and exit.
 
   --version,-v
-    Print the version of alarm and exit. (Currently: {ALARM_VERSION})
+    Print the version of alarm and exit. (Currently: ''' + ALARM_VERSION + ''')
 
 '''
     width = shutil.get_terminal_size()[0] - 2
@@ -1302,7 +1312,7 @@ name <tag>.lst . Then, <tag> will be considered a tag of each listed repository.
         f.write(l.rstrip() + '\n')
 
 def print_version(f):
-    f.write(f'alarm, version {ALARM_VERSION}\nwritten by Philipp Czerner')
+    f.write('alarm, version %s\nwritten by Philipp Czerner\n' % (ALARM_VERSION,))
 
 class Arg_parse_error(Exception): pass
     
@@ -1312,7 +1322,7 @@ def parse_cmdline(args):
     
     def pop(name):
         if not args:
-            raise Arg_parse_error(f'Unexpected end of arguments, expected {name}')
+            raise Arg_parse_error('Unexpected end of arguments, expected %s' % (name,))
         return args.pop()
 
     if not args:
@@ -1334,13 +1344,13 @@ def parse_cmdline(args):
         if arg.startswith('-'):
             op = arg
             if op not in options.argmap:
-                raise Arg_parse_error(f'Unknown option {op}')
+                raise Arg_parse_error('Unknown option %s' % (op,))
             options.set(options.argmap[op], pop('the argument to ' + op))
         else:
             cmd = arg
             if cmd not in options._commands:
                 cmds = ', '.join(options._commands)
-                raise Arg_parse_error(f'Unknown command {cmd}, must be one of {cmds}')
+                raise Arg_parse_error('Unknown command %s, must be one of %s' % (cmd, cmds))
 
             cmd_args = []
             num_args = options._commands[cmd]
@@ -1351,10 +1361,10 @@ def parse_cmdline(args):
                 num_args = min(1, len(args))
                 
             for i in range(num_args):
-                cmd_args.append(pop(f'argument {i+1} to command {cmd}'))
+                cmd_args.append(pop('argument %d to command %s' % (i+1, cmd)))
 
             if args:
-                err = f'Too many arguments: {cmd} expects {num_args}, got {num_args + len(args)}'
+                err = 'Too many arguments: %s expects %d, got %d' % (cmd, num_args, num_args + len(args))
                 raise Arg_parse_error(err)
             
             return cmd, cmd_args
